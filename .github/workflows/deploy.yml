@@ -1,0 +1,103 @@
+# seven-policies (política de privacidade): compila no GitHub (node:22-alpine) e publica um commit único no branch órfão `deploy` com html/ (o dist final),
+# nginx.conf (o do repo) e versao.txt. Push fora da main (ci/**) publica em `deploy-teste`. O serviço services/seven-sites da
+# seven-vps (pasta sites/seven-policies) puxa o `deploy` e só copia: a VPS não compila. Falha: últimas linhas no branch `deploy-erro` e
+# nada é publicado (o site no ar continua o anterior). Valores públicos do build podem ser trocados em Settings > Variables.
+name: deploy
+
+on:
+  push:
+    branches: [main, "ci/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: node:22-alpine
+    steps:
+      - name: Dependencias do sistema
+        shell: sh
+        run: apk add --no-cache git bash tar nginx
+
+      - uses: actions/checkout@v4
+
+      - name: Compilar e montar pacote
+        env:
+          SEM_BUILD: "1"
+        run: |
+          exec > >(tee -a /tmp/passos.log) 2>&1
+          set -euxo pipefail
+          rm -rf /tmp/pacote && mkdir -p /tmp/pacote/html
+          cp -a index.html styles.css logo /tmp/pacote/html/
+          cp nginx.conf /tmp/pacote/nginx.conf
+          printf '%s\n' "$GITHUB_SHA" > /tmp/pacote/versao.txt
+          find /tmp/pacote \( -name .gitignore -o -name .gitattributes \) -type f -delete
+          achados=$(find /tmp/pacote \( -name '.env*' -o -name '*.pem' -o -name 'id_rsa*' -o -name '*.key' \) -print); if [ -n "$achados" ]; then echo "$achados"; exit 1; fi
+          if grep -R -l -I -E -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e 'gh[pousr]_[A-Za-z0-9]{30,}' -e 'github_pat_[A-Za-z0-9_]{20,}' -e 'sk_live_[A-Za-z0-9]{10,}' -e 'AKIA[0-9A-Z]{16}' /tmp/pacote; then echo "segredo no pacote"; exit 1; fi
+          test -f /tmp/pacote/html/index.html
+          test "$(find /tmp/pacote/html -type f | wc -l)" -ge 5
+          mkdir -p /tmp/ngx && echo 'events {} http { include /tmp/pacote/nginx.conf; }' > /tmp/ngx/teste.conf && nginx -t -c /tmp/ngx/teste.conf
+          du -sh /tmp/pacote
+          tar -C /tmp -cf /tmp/pacote.tar pacote
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pacote
+          path: /tmp/pacote.tar
+          retention-days: 3
+
+      - name: Publicar log de erro
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/erro && cd /tmp/erro
+          { echo "run ${GITHUB_RUN_ID} sha ${GITHUB_SHA} ref ${GITHUB_REF_NAME}"; tail -n 150 /tmp/passos.log 2>/dev/null || echo "(sem log)"; } > erro.log
+          git init -q -b deploy-erro
+          git config user.name "seven-policies-build"
+          git config user.email "build@seven.business"
+          git add erro.log
+          git commit -q -m "erro ${GITHUB_SHA}"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin HEAD:refs/heads/deploy-erro 2>&1 | sed "s/${GH_TOKEN}/***/g"
+
+  publicar:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DEPLOY_BRANCH: ${{ github.ref_name == 'main' && 'deploy' || 'deploy-teste' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pacote
+          path: /tmp
+      - name: Publicar no branch ${{ env.DEPLOY_BRANCH }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tar -C /tmp -xf /tmp/pacote.tar
+          cd /tmp/pacote
+          git init -q -b "$DEPLOY_BRANCH"
+          git config user.name "seven-policies-build"
+          git config user.email "build@seven.business"
+          git config core.autocrlf false
+          git add -A -f
+          git commit -q -m "build ${GITHUB_SHA}"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin "HEAD:refs/heads/${DEPLOY_BRANCH}" 2>&1 | sed "s/${GH_TOKEN}/***/g"
+          echo "publicado ${DEPLOY_BRANCH} $(git rev-parse HEAD) (fonte ${GITHUB_SHA})" >> "$GITHUB_STEP_SUMMARY"
